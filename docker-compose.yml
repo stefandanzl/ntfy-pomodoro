@@ -1,0 +1,23 @@
+services:
+    pomodoro:
+        build: .
+        container_name: pomodoro
+        restart: unless-stopped
+        environment:
+            - TZ=Europe/Vienna
+            # Wird via .env-File aus dem gleichen Verzeichnis gezogen
+            - NTFY_USERNAME=${NTFY_USERNAME:-}
+            - NTFY_PASSWORD=${NTFY_PASSWORD:-}
+        volumes:
+            - ./config.yml:/etc/pomodoro/config.yml:ro
+
+        # Falls du auf demselben Docker-Network wie ntfy hängen willst und in
+        # config.yml dann z.B. http://ntfy:80 statt https://ntfy.danzl.it nutzen
+        # möchtest, hier reinhängen:
+        #
+        # networks:
+        #   - ntfy_net
+
+# networks:
+#   ntfy_net:
+#     external: true

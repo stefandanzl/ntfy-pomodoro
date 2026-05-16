@@ -1,0 +1,31 @@
+# Server-Endpunkt (ohne trailing slash)
+server: https://ntfy.danzl.it
+
+# Basic Auth.  Wenn NTFY_USERNAME / NTFY_PASSWORD als Env-Var gesetzt sind,
+# überschreiben die diese Werte (Convention: Secrets nicht ins YAML).
+auth:
+  username: pomodoro-bot
+  # password: hier-oder-via-NTFY_PASSWORD-env
+
+# Topic, an dem auf ON/OFF gehört wird.
+control_topic: pomodoro-control
+
+# Was nach dem Publish mit der Notification passiert.
+#   mode: clear (PUT /<topic>/<seq>/clear)  -- aus Drawer raus, History bleibt
+#         delete (DELETE /<topic>/<seq>)    -- aus Drawer + Client-DB raus
+#         none                              -- nichts tun
+#   delay_seconds: Verzögerung in Sekunden, 0 deaktiviert removal komplett
+removal:
+  mode: clear
+  delay_seconds: 60
+
+# Cron-Jobs.  Standard 5-Feld Cron-Syntax: minute hour day-of-month month day-of-week
+# Komma-Listen (0,30), Ranges (8-17, 1-5) und Wildcards (*) gehen.
+jobs:
+  - cron: "0,30 8-17 * * 1-5"
+    topic: pomodoro-start
+    message: START
+
+  - cron: "25,55 8-17 * * 1-5"
+    topic: pomodoro-pause
+    message: PAUSE
