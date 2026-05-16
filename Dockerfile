@@ -2,7 +2,7 @@
 
 # ----- Build stage -----
 FROM golang:1.26.3-alpine3.23 AS build
-RUN apk add --no-cache ca-certificates
+# RUN apk add --no-cache ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -11,9 +11,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" -trimpath -o /pomodoro
 
 # ----- Runtime stage -----
-FROM scratch
-# TLS roots for the HTTPS calls to ntfy
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+FROM alpine:3.23
+RUN apk add --no-cache ca-certificates
 COPY --from=build /pomodoro /pomodoro
+RUN mkdir -p /etc/pomodoro
 ENTRYPOINT ["/pomodoro"]
 CMD ["-config", "/etc/pomodoro/config.yml"]

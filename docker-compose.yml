@@ -6,8 +6,8 @@ services:
         environment:
             - TZ=Europe/Vienna
             # Wird via .env-File aus dem gleichen Verzeichnis gezogen
-            - NTFY_USERNAME=${NTFY_USERNAME:-}
-            - NTFY_PASSWORD=${NTFY_PASSWORD:-}
+            #- NTFY_USERNAME=${NTFY_USERNAME:-}
+            #- NTFY_PASSWORD=${NTFY_PASSWORD:-}
         volumes:
             - ./config.yml:/etc/pomodoro/config.yml:ro
 
