@@ -1,23 +1,31 @@
 # Server-Endpunkt (ohne trailing slash)
 server: https://ntfy.danzl.it
 
-# Basic Auth.  Wenn NTFY_USERNAME / NTFY_PASSWORD als Env-Var gesetzt sind,
-# überschreiben die diese Werte (Convention: Secrets nicht ins YAML).
+# Auth.  Entweder Basic (username + password) ODER Bearer Token — Token
+# gewinnt falls beides gesetzt ist.
+# Env-Overrides: NTFY_USERNAME, NTFY_PASSWORD, NTFY_TOKEN (Secrets nicht ins YAML).
 auth:
   username: pomodoro-bot
   # password: hier-oder-via-NTFY_PASSWORD-env
+  # token: tk_xxxxxxxx           # oder via NTFY_TOKEN-env
 
 # Topic, an dem auf ON/OFF gehört wird.
 control_topic: pomodoro-control
 
 # Was nach dem Publish mit der Notification passiert.
-#   mode: clear (PUT /<topic>/<seq>/clear)  -- aus Drawer raus, History bleibt
-#         delete (DELETE /<topic>/<seq>)    -- aus Drawer + Client-DB raus
-#         none                              -- nichts tun
-#   delay_seconds: Verzögerung in Sekunden, 0 deaktiviert removal komplett
+#   mode:
+#     clear          PUT /<topic>/<seq>/clear nach delay_seconds
+#                    (Drawer dismissed, History bleibt sichtbar)
+#     delete         DELETE /<topic>/<seq> nach delay_seconds
+#                    (Drawer raus + aus Client-DB raus)
+#     clear_on_next  Vorherige Notification clearen sobald die nächste publishen geht
+#                    (delay_seconds ignoriert; gilt global über alle Output-Topics)
+#     delete_on_next analog clear_on_next aber mit DELETE
+#     none           Nichts tun
+#   delay_seconds: nur relevant bei mode=clear|delete.  0 deaktiviert removal komplett.
 removal:
-  mode: clear
-  delay_seconds: 60
+  mode: clear_on_next
+  delay_seconds: 0
 
 # Cron-Jobs.  Standard 5-Feld Cron-Syntax: minute hour day-of-month month day-of-week
 # Komma-Listen (0,30), Ranges (8-17, 1-5) und Wildcards (*) gehen.

@@ -91,21 +91,29 @@ func loadConfig(path string) (*Config, error) {
 		cfg.Removal.Mode = "clear"
 	}
 	switch cfg.Removal.Mode {
-	case "clear", "delete", "none":
+	case "clear", "delete", "none", "clear_on_next", "delete_on_next":
 	default:
-		return nil, fmt.Errorf("removal.mode must be clear|delete|none, got %q", cfg.Removal.Mode)
+		return nil, fmt.Errorf("removal.mode must be one of clear|delete|none|clear_on_next|delete_on_next, got %q", cfg.Removal.Mode)
 	}
 	return &cfg, nil
 }
 
 // ---------- State ----------
 
-// State holds the in-memory ON/OFF flag and the timestamp of the last poll
-// against the control topic.  Default is ON at startup (not persisted).
+// State holds the in-memory ON/OFF flag, the timestamp of the last poll
+// against the control topic, and a pointer to the most recently published
+// notification (used by the *_on_next removal modes).  Default is ON at
+// startup; nothing is persisted.
 type State struct {
 	mu       sync.Mutex
 	enabled  bool
 	lastPoll time.Time
+	skip     bool
+
+	// Last successfully published message — used to clear/delete the previous
+	// notification when the next one is published.  Empty means "no previous".
+	lastPubTopic string
+	lastPubSeq   string
 }
 
 func NewState() *State {
@@ -118,10 +126,20 @@ func (s *State) LastPoll() time.Time {
 	return s.lastPoll
 }
 
+// SwapLastPub atomically replaces the "last published" pointer with the given
+// topic/seqID and returns whatever was there before (empty strings on first call).
+func (s *State) SwapLastPub(topic, seqID string) (prevTopic, prevSeq string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prevTopic, prevSeq = s.lastPubTopic, s.lastPubSeq
+	s.lastPubTopic, s.lastPubSeq = topic, seqID
+	return
+}
+
 // Apply processes a batch of control messages in chronological order, updates
 // the lastPoll timestamp, and returns the resulting enabled flag.  Unknown
 // message bodies are ignored.
-func (s *State) Apply(cmds []string, newLastPoll time.Time) bool {
+func (s *State) Apply(cmds []string, newLastPoll time.Time, cron *cron.Cron) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastPoll = newLastPoll
@@ -131,6 +149,8 @@ func (s *State) Apply(cmds []string, newLastPoll time.Time) bool {
 			s.enabled = true
 		case "OFF":
 			s.enabled = false
+		case "SKIP":
+			s.skip = false
 		}
 	}
 	return s.enabled
@@ -140,7 +160,7 @@ func (s *State) Apply(cmds []string, newLastPoll time.Time) bool {
 
 type Client struct {
 	server string
-	auth   string // pre-encoded "Basic xxx" or "Bearer xxx" header value, or empty
+	auth   string // pre-encoded "Basic xxx" header value, or empty
 	http   *http.Client
 }
 
@@ -214,8 +234,6 @@ func (c *Client) Poll(topic string, since time.Time) ([]string, time.Time, error
 // parsing the POST response.
 func (c *Client) Publish(topic, seqID, message string) error {
 	url := fmt.Sprintf("%s/%s/%s", c.server, topic, seqID)
-
-	fmt.Println("POST", url, strings.NewReader(message))
 	resp, err := c.do("POST", url, strings.NewReader(message))
 	if err != nil {
 		return err
@@ -225,7 +243,6 @@ func (c *Client) Publish(topic, seqID, message string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("publish: status %d", resp.StatusCode)
 	}
-	fmt.Println("Published message: ",message)
 	return nil
 }
 
@@ -259,7 +276,7 @@ func (c *Client) Remove(topic, seqID, mode string) error {
 // It polls the control topic for any new ON/OFF since the last poll,
 // publishes the job's message if currently enabled, and optionally
 // schedules a clear/delete after the configured delay.
-func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.Logger) {
+func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.Logger, cron *cron.Cron) {
 	log = log.With("topic", job.Topic, "message", job.Message)
 
 	// 1. Poll for new control commands.
@@ -271,7 +288,7 @@ func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.
 	for _, c := range cmds {
 		log.Info("control command", "cmd", c)
 	}
-	enabled := state.Apply(cmds, newSince)
+	enabled := state.Apply(cmds, newSince, cron)
 
 	if !enabled {
 		log.Info("disabled — skipping publish")
@@ -287,24 +304,51 @@ func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.
 	}
 	log.Info("published", "seq", seqID)
 
-	// 3. Schedule removal if configured.
-	if cfg.Removal.Mode == "none" || cfg.Removal.DelaySeconds <= 0 {
+	// 3. Removal — either time-delayed (clear/delete) or triggered by the
+	//    next publish (clear_on_next/delete_on_next).
+	switch cfg.Removal.Mode {
+	case "none":
 		return
-	}
-	delay := time.Duration(cfg.Removal.DelaySeconds) * time.Second
-	time.AfterFunc(delay, func() {
-		if err := client.Remove(job.Topic, seqID, cfg.Removal.Mode); err != nil {
-			log.Error("remove failed", "err", err, "seq", seqID, "mode", cfg.Removal.Mode)
+
+	case "clear", "delete":
+		if cfg.Removal.DelaySeconds <= 0 {
 			return
 		}
-		log.Info("removed", "seq", seqID, "mode", cfg.Removal.Mode)
-	})
+		mode := cfg.Removal.Mode
+		delay := time.Duration(cfg.Removal.DelaySeconds) * time.Second
+		time.AfterFunc(delay, func() {
+			if err := client.Remove(job.Topic, seqID, mode); err != nil {
+				log.Error("remove failed", "err", err, "seq", seqID, "mode", mode)
+				return
+			}
+			log.Info("removed", "seq", seqID, "mode", mode)
+		})
+
+	case "clear_on_next", "delete_on_next":
+		// Underlying action: drop the "_on_next" suffix.
+		action := "clear"
+		if cfg.Removal.Mode == "delete_on_next" {
+			action = "delete"
+		}
+		// Swap in our new ID; whatever was there is now the "previous" to remove.
+		prevTopic, prevSeq := state.SwapLastPub(job.Topic, seqID)
+		if prevSeq == "" {
+			log.Info("no previous notification yet — nothing to remove")
+			return
+		}
+		if err := client.Remove(prevTopic, prevSeq, action); err != nil {
+			log.Error("remove previous failed",
+				"err", err, "seq", prevSeq, "topic", prevTopic, "mode", action)
+			return
+		}
+		log.Info("removed previous", "seq", prevSeq, "topic", prevTopic, "mode", action)
+	}
 }
 
 // ---------- main ----------
 
 func main() {
-	cfgPath := flag.String("config", "config.yml", "path to config file")
+	cfgPath := flag.String("config", "/etc/pomodoro/config.yml", "path to config file")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -331,7 +375,7 @@ func main() {
 	for _, job := range cfg.Jobs {
 		job := job // capture for closure
 		id, err := c.AddFunc(job.Cron, func() {
-			runJob(client, state, cfg, job, log)
+			runJob(client, state, cfg, job, log, c)
 		})
 		if err != nil {
 			log.Error("invalid cron expression", "cron", job.Cron, "err", err)
@@ -342,7 +386,6 @@ func main() {
 	}
 	c.Start()
 	log.Info("pomodoro daemon started")
-
 	client.Publish(cfg.ControlTopic, "test", "Pomodoro Cron Server started")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
