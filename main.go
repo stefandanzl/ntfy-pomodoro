@@ -1,6 +1,6 @@
 // pomodoro — a tiny ntfy-driven pomodoro timer daemon.
 //
-// Schedules messages to ntfy topics on a cron, pollable ON/OFF state via a
+// Schedules messages to ntfy topics on a cron, pollable ON/OFF/SKIP state via a
 // control topic, and optionally clears or deletes published notifications
 // after a delay so the topic stays tidy.
 package main
@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,7 +48,7 @@ type AuthConfig struct {
 }
 
 type RemovalConfig struct {
-	Mode         string `yaml:"mode"`          // "clear" | "delete" | "none"
+	Mode         string `yaml:"mode"`          // "clear" | "delete" | "none" | "clear_on_next" | "delete_on_next"
 	DelaySeconds int    `yaml:"delay_seconds"` // 0 disables removal
 }
 
@@ -100,24 +101,21 @@ func loadConfig(path string) (*Config, error) {
 
 // ---------- State ----------
 
-// State holds the in-memory ON/OFF flag, the timestamp of the last poll
-// against the control topic, and a pointer to the most recently published
-// notification (used by the *_on_next removal modes).  Default is ON at
-// startup; nothing is persisted.
+// State holds the in-memory ON/OFF flag, an optional skip-until timestamp,
+// the timestamp of the last poll against the control topic, and a pointer to
+// the most recently published notification.  Default is ON at startup.
 type State struct {
-	mu       sync.Mutex
-	enabled  bool
-	lastPoll time.Time
-	skip     bool
-
-	// Last successfully published message — used to clear/delete the previous
-	// notification when the next one is published.  Empty means "no previous".
+	mu           sync.Mutex
+	enabled      bool
+	skipUntil    time.Time // if non-zero, overrides enabled→false until this time
+	lastPoll     time.Time
 	lastPubTopic string
 	lastPubSeq   string
+	loc          *time.Location // for computing "start of next day"
 }
 
-func NewState() *State {
-	return &State{enabled: true, lastPoll: time.Now()}
+func NewState(loc *time.Location) *State {
+	return &State{enabled: true, lastPoll: time.Now(), loc: loc}
 }
 
 func (s *State) LastPoll() time.Time {
@@ -136,31 +134,68 @@ func (s *State) SwapLastPub(topic, seqID string) (prevTopic, prevSeq string) {
 	return
 }
 
-// Apply processes a batch of control messages in chronological order, updates
-// the lastPoll timestamp, and returns the resulting enabled flag.  Unknown
-// message bodies are ignored.
-func (s *State) Apply(cmds []string, newLastPoll time.Time, cron *cron.Cron) bool {
+// IsEnabled returns true if notifications should be published right now.
+// An active (non-expired) skip overrides enabled to false and auto-clears when expired.
+func (s *State) IsEnabled(log *slog.Logger) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastPoll = newLastPoll
-	for _, c := range cmds {
-		switch strings.ToUpper(strings.TrimSpace(c)) {
-		case "ON":
-			s.enabled = true
-		case "OFF":
-			s.enabled = false
-		case "SKIP":
-			s.skip = false
+	now := time.Now().In(s.loc)
+	if !s.skipUntil.IsZero() {
+		if !now.Before(s.skipUntil) {
+			// Skip period has passed — clear it.
+			log.Info("resetting skipping from value " + s.skipUntil.String())
+			s.skipUntil = time.Time{}
+		} else {
+			log.Info("SKIP active until " + s.skipUntil.String())
+			return false
 		}
 	}
 	return s.enabled
+}
+
+// Apply processes a batch of control messages in chronological order, updates
+// the lastPoll timestamp.  Unknown message bodies are ignored.
+// Commands: ON, OFF, SKIP [days]
+func (s *State) Apply(cmds []string, newLastPoll time.Time, log *slog.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastPoll = newLastPoll
+
+	for _, c := range cmds {
+		cmd := strings.ToUpper(strings.TrimSpace(c))
+
+		switch {
+		case cmd == "ON":
+			s.enabled = true
+			s.skipUntil = time.Time{} // cancel any active skip
+
+		case cmd == "OFF":
+			s.enabled = false
+			s.skipUntil = time.Time{} // cancel any active skip
+
+		case cmd == "SKIP" || strings.HasPrefix(cmd, "SKIP "):
+			additionalDays := 0
+			if parts := strings.Fields(c); len(parts) > 1 {
+				if d, err := strconv.Atoi(parts[1]); err == nil && d > 0 {
+					additionalDays = d
+				}
+			}
+			now := time.Now().In(s.loc)
+			nextMidnight := time.Date(
+				now.Year(), now.Month(), now.Day()+1,
+				0, 0, 0, 0, s.loc,
+			)
+			s.skipUntil = nextMidnight.AddDate(0, 0, additionalDays)
+			log.Info("Set new skipUntil for " + s.skipUntil.String())
+		}
+	}
 }
 
 // ---------- ntfy client ----------
 
 type Client struct {
 	server string
-	auth   string // pre-encoded "Basic xxx" header value, or empty
+	auth   string // pre-encoded "Basic xxx" or "Bearer xxx" header value, or empty
 	http   *http.Client
 }
 
@@ -218,7 +253,6 @@ func (c *Client) Poll(topic string, since time.Time) ([]string, time.Time, error
 			continue
 		}
 		if m.Event != "message" {
-			// Skip 'open', 'keepalive', 'message_clear', 'message_delete', ...
 			continue
 		}
 		msgs = append(msgs, m.Message)
@@ -273,10 +307,7 @@ func (c *Client) Remove(topic, seqID, mode string) error {
 // ---------- Job runner ----------
 
 // runJob is invoked by the cron scheduler for each scheduled entry.
-// It polls the control topic for any new ON/OFF since the last poll,
-// publishes the job's message if currently enabled, and optionally
-// schedules a clear/delete after the configured delay.
-func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.Logger, cron *cron.Cron) {
+func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.Logger) {
 	log = log.With("topic", job.Topic, "message", job.Message)
 
 	// 1. Poll for new control commands.
@@ -288,9 +319,12 @@ func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.
 	for _, c := range cmds {
 		log.Info("control command", "cmd", c)
 	}
-	enabled := state.Apply(cmds, newSince, cron)
 
-	if !enabled {
+	// Apply ON/OFF/SKIP commands (mutates state internally)
+	state.Apply(cmds, newSince, log)
+
+	// Check if we are allowed to publish
+	if !state.IsEnabled(log) {
 		log.Info("disabled — skipping publish")
 		return
 	}
@@ -325,12 +359,10 @@ func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.
 		})
 
 	case "clear_on_next", "delete_on_next":
-		// Underlying action: drop the "_on_next" suffix.
 		action := "clear"
 		if cfg.Removal.Mode == "delete_on_next" {
 			action = "delete"
 		}
-		// Swap in our new ID; whatever was there is now the "previous" to remove.
 		prevTopic, prevSeq := state.SwapLastPub(job.Topic, seqID)
 		if prevSeq == "" {
 			log.Info("no previous notification yet — nothing to remove")
@@ -348,7 +380,7 @@ func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.
 // ---------- main ----------
 
 func main() {
-	cfgPath := flag.String("config", "/etc/pomodoro/config.yml", "path to config file")
+	cfgPath := flag.String("config", "config.yml", "path to config file")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -369,13 +401,13 @@ func main() {
 	)
 
 	client := NewClient(cfg.Server, cfg.Auth)
-	state := NewState()
+	state := NewState(time.Local)
 
 	c := cron.New(cron.WithLocation(time.Local))
 	for _, job := range cfg.Jobs {
 		job := job // capture for closure
 		id, err := c.AddFunc(job.Cron, func() {
-			runJob(client, state, cfg, job, log, c)
+			runJob(client, state, cfg, job, log)
 		})
 		if err != nil {
 			log.Error("invalid cron expression", "cron", job.Cron, "err", err)
