@@ -49,7 +49,7 @@ type AuthConfig struct {
 
 type RemovalConfig struct {
 	Mode         string `yaml:"mode"`          // "clear" | "delete" | "none" | "clear_on_next" | "delete_on_next"
-	DelaySeconds int    `yaml:"delay_seconds"` // 0 disables removal
+	DelaySeconds int    `yaml:"delay_seconds"` // 0 disables removal; for clear_on_next/delete_on_next, acts as fallback cleanup delay
 }
 
 type JobConfig struct {
@@ -101,21 +101,32 @@ func loadConfig(path string) (*Config, error) {
 
 // ---------- State ----------
 
+// TopicState holds the sequence ID and cleanup timer for a single topic's
+// most recently published notification.
+type TopicState struct {
+	Seq   string
+	Timer *time.Timer
+}
+
 // State holds the in-memory ON/OFF flag, an optional skip-until timestamp,
-// the timestamp of the last poll against the control topic, and a pointer to
-// the most recently published notification.  Default is ON at startup.
+// the timestamp of the last poll against the control topic, and per-topic
+// notification tracking.  Default is ON at startup.
 type State struct {
-	mu           sync.Mutex
-	enabled      bool
-	skipUntil    time.Time // if non-zero, overrides enabled→false until this time
-	lastPoll     time.Time
-	lastPubTopic string
-	lastPubSeq   string
-	loc          *time.Location // for computing "start of next day"
+	mu          sync.Mutex
+	enabled     bool
+	skipUntil   time.Time // if non-zero, overrides enabled→false until this time
+	lastPoll    time.Time
+	topicStates map[string]TopicState
+	loc         *time.Location // for computing "start of next day"
 }
 
 func NewState(loc *time.Location) *State {
-	return &State{enabled: true, lastPoll: time.Now(), loc: loc}
+	return &State{
+		enabled:     true,
+		lastPoll:    time.Now(),
+		topicStates: make(map[string]TopicState),
+		loc:         loc,
+	}
 }
 
 func (s *State) LastPoll() time.Time {
@@ -124,14 +135,32 @@ func (s *State) LastPoll() time.Time {
 	return s.lastPoll
 }
 
-// SwapLastPub atomically replaces the "last published" pointer with the given
-// topic/seqID and returns whatever was there before (empty strings on first call).
-func (s *State) SwapLastPub(topic, seqID string) (prevTopic, prevSeq string) {
+// SwapTopicState atomically replaces the TopicState for a given topic with the
+// provided seqID and timer, returning the previous seq and timer for that topic.
+func (s *State) SwapTopicState(topic, seq string, timer *time.Timer) (prevSeq string, prevTimer *time.Timer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prevTopic, prevSeq = s.lastPubTopic, s.lastPubSeq
-	s.lastPubTopic, s.lastPubSeq = topic, seqID
+	prevState := s.topicStates[topic]
+	prevSeq, prevTimer = prevState.Seq, prevState.Timer
+	s.topicStates[topic] = TopicState{Seq: seq, Timer: timer}
 	return
+}
+
+// ClearTopicIfMatches removes the TopicState for a topic if the seqID matches,
+// stopping its timer. Returns true if the state was cleared (meaning this was
+// still the current notification for that topic).
+func (s *State) ClearTopicIfMatches(topic, seq string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, exists := s.topicStates[topic]
+	if !exists || state.Seq != seq {
+		return false
+	}
+	if state.Timer != nil {
+		state.Timer.Stop()
+	}
+	delete(s.topicStates, topic)
+	return true
 }
 
 // IsEnabled returns true if notifications should be published right now.
@@ -363,17 +392,41 @@ func runJob(client *Client, state *State, cfg *Config, job JobConfig, log *slog.
 		if cfg.Removal.Mode == "delete_on_next" {
 			action = "delete"
 		}
-		prevTopic, prevSeq := state.SwapLastPub(job.Topic, seqID)
+
+		// Create fallback cleanup timer if delay is configured
+		var newTimer *time.Timer
+		if cfg.Removal.DelaySeconds > 0 {
+			myTopic, mySeq := job.Topic, seqID
+			delay := time.Duration(cfg.Removal.DelaySeconds) * time.Second
+			newTimer = time.AfterFunc(delay, func() {
+				if state.ClearTopicIfMatches(myTopic, mySeq) {
+					if err := client.Remove(myTopic, mySeq, action); err != nil {
+						log.Error("fallback remove failed",
+							"err", err, "seq", mySeq, "topic", myTopic, "mode", action)
+						return
+					}
+					log.Info("fallback removed", "seq", mySeq, "topic", myTopic, "mode", action)
+				}
+			})
+		}
+
+		// Swap topic state and stop old timer
+		prevSeq, prevTimer := state.SwapTopicState(job.Topic, seqID, newTimer)
+		if prevTimer != nil {
+			prevTimer.Stop()
+		}
+
+		// Clear previous notification immediately (if there was one)
 		if prevSeq == "" {
 			log.Info("no previous notification yet — nothing to remove")
 			return
 		}
-		if err := client.Remove(prevTopic, prevSeq, action); err != nil {
+		if err := client.Remove(job.Topic, prevSeq, action); err != nil {
 			log.Error("remove previous failed",
-				"err", err, "seq", prevSeq, "topic", prevTopic, "mode", action)
+				"err", err, "seq", prevSeq, "topic", job.Topic, "mode", action)
 			return
 		}
-		log.Info("removed previous", "seq", prevSeq, "topic", prevTopic, "mode", action)
+		log.Info("removed previous", "seq", prevSeq, "topic", job.Topic, "mode", action)
 	}
 }
 

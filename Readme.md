@@ -11,7 +11,11 @@ Control-Topic per `ON`/`OFF`-Message ein- und ausgeschaltet werden kann.
   1. Poll des Control-Topics (`?poll=1&since=<last_poll_unix>`)
   2. Letzte `ON`/`OFF`-Message aus dem Resultat übernehmen → In-Memory-State
   3. Wenn `ON`: Publish mit Custom Sequence-ID (`p<unix-ts>`) ans Output-Topic
-  4. `time.AfterFunc(delay, …)` → Clear oder Delete nach konfigurierter Verzögerung
+  4. Removal basierend auf `removal.mode`:
+     * `clear`/`delete`: Timer pro Notification → Clear/Delete nach `delay_seconds`
+     * `clear_on_next`/`delete_on_next`: Vorherige Notification sofort löschen, + Fallback-Timer
+       für die letzte Notification (`delay_seconds`). Z.B. nach 1 Stunde (3600s) damit
+       am Tagesende keine stale Notifications übrig bleiben.
 * State default `ON` beim Start, nicht persistent.
 
 ## Quickstart

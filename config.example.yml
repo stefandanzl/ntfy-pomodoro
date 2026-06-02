@@ -19,10 +19,12 @@ control_topic: pomodoro-control
 #     delete         DELETE /<topic>/<seq> nach delay_seconds
 #                    (Drawer raus + aus Client-DB raus)
 #     clear_on_next  Vorherige Notification clearen sobald die nächste publishen geht
-#                    (delay_seconds ignoriert; gilt global über alle Output-Topics)
+#                    (delay_seconds als Fallback: letzte Notification wird nach X Sekunden
+#                     auto-gelöscht falls keine neue kommt; z.B. Tagesende)
 #     delete_on_next analog clear_on_next aber mit DELETE
 #     none           Nichts tun
-#   delay_seconds: nur relevant bei mode=clear|delete.  0 deaktiviert removal komplett.
+#   delay_seconds: relevant für alle modes außer none.  0 deaktiviert removal komplett.
+#                  Für clear_on_next/delete_on_next als Fallback-Timer (z.B. 3600 = 1 Stunde).
 removal:
   mode: clear_on_next
   delay_seconds: 0
